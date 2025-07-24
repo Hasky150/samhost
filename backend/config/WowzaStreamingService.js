@@ -17,21 +17,47 @@ class WowzaStreamingService {
 
     async initializeFromDatabase(userId) {
         try {
-            // Buscar dados do servidor Wowza baseado no usuário
-            let serverId = this.serverId;
+            // Buscar dados do usuário e seu servidor Wowza
+            let userServerId = null;
+            let userLogin = null;
             
-            // Primeiro, tentar buscar o servidor do streaming do usuário
-            const [streamingRows] = await db.execute(
-                'SELECT codigo_servidor FROM streamings WHERE codigo_cliente = ? OR codigo = ? LIMIT 1',
-                [userId, userId]
+            // Primeiro, buscar dados do usuário (streaming ou revenda)
+            const [userRows] = await db.execute(
+                `SELECT 
+                    s.codigo_servidor,
+                    s.login,
+                    s.identificacao,
+                    s.email,
+                    'streaming' as tipo
+                 FROM streamings s 
+                 WHERE s.codigo = ? OR s.codigo_cliente = ?
+                 UNION
+                 SELECT 
+                    NULL as codigo_servidor,
+                    r.email as login,
+                    r.nome as identificacao,
+                    r.email,
+                    'revenda' as tipo
+                 FROM revendas r 
+                 WHERE r.codigo = ?
+                 LIMIT 1`,
+                [userId, userId, userId]
             );
 
-            if (streamingRows.length > 0) {
-                serverId = streamingRows[0].codigo_servidor;
+            if (userRows.length > 0) {
+                const userData = userRows[0];
+                userServerId = userData.codigo_servidor;
+                userLogin = userData.login || userData.email?.split('@')[0];
+                
+                console.log(`Usuário encontrado: ${userData.identificacao} (${userData.tipo})`);
+                console.log(`Servidor do usuário: ${userServerId || 'Não definido'}`);
+                console.log(`Login do usuário: ${userLogin}`);
             }
 
-            // Se não encontrou servidor específico, buscar o melhor servidor disponível
+            // Se não encontrou servidor específico do usuário, buscar o melhor servidor disponível
+            let serverId = userServerId;
             if (!serverId) {
+                console.log('Servidor não definido para o usuário, buscando melhor servidor disponível...');
                 const [bestServerRows] = await db.execute(
                     `SELECT codigo FROM wowza_servers 
                      WHERE status = 'ativo' 
@@ -41,6 +67,7 @@ class WowzaStreamingService {
                 
                 if (bestServerRows.length > 0) {
                     serverId = bestServerRows[0].codigo;
+                    console.log(`Servidor selecionado automaticamente: ${serverId}`);
                 }
             }
 
@@ -56,7 +83,8 @@ class WowzaStreamingService {
                     streamings_ativas,
                     load_cpu,
                     status,
-                    tipo_servidor
+                    tipo_servidor,
+                    caminho_conteudo
                  FROM wowza_servers 
                  WHERE codigo = ? AND status = 'ativo'`,
                 [serverId || 1]
@@ -69,6 +97,8 @@ class WowzaStreamingService {
                 this.wowzaPort = 8087; // Porta da API REST do Wowza
                 this.wowzaUser = 'admin'; // Usuário padrão da API
                 this.wowzaPassword = server.senha_root; // Usar senha root como senha da API
+                this.contentPath = server.caminho_conteudo || '/usr/local/WowzaStreamingEngine/content';
+                this.userLogin = userLogin;
                 this.serverInfo = {
                     id: server.codigo,
                     nome: server.nome,
@@ -76,6 +106,7 @@ class WowzaStreamingService {
                     streamings_ativas: server.streamings_ativas,
                     load_cpu: server.load_cpu,
                     tipo_servidor: server.tipo_servidor
+                    caminho_conteudo: server.caminho_conteudo
                 };
 
                 this.baseUrl = `http://${this.wowzaHost}:${this.wowzaPort}/v2/servers/_defaultServer_/vhosts/_defaultVHost_`;
@@ -90,6 +121,29 @@ class WowzaStreamingService {
         } catch (error) {
             console.error('Erro ao inicializar configurações do Wowza:', error);
             return false;
+        }
+    }
+
+    // Método para obter o caminho completo do conteúdo do usuário
+    getUserContentPath(userLogin) {
+        if (!this.contentPath || !userLogin) {
+            return '/usr/local/WowzaStreamingEngine/content';
+        }
+        return `${this.contentPath}/${userLogin}`;
+    }
+
+    // Método para criar diretório do usuário no servidor Wowza
+    async ensureUserDirectory(userLogin) {
+        try {
+            const userPath = this.getUserContentPath(userLogin);
+            console.log(`Garantindo que o diretório do usuário existe: ${userPath}`);
+            
+            // Em produção, você faria uma chamada SSH ou API para criar o diretório
+            // Por enquanto, apenas logamos
+            return { success: true, path: userPath };
+        } catch (error) {
+            console.error('Erro ao criar diretório do usuário:', error);
+            return { success: false, error: error.message };
         }
     }
 

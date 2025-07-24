@@ -83,14 +83,18 @@ function ModalVideo({
       return video.url;
     }
     
-    // Se é uma URL relativa, construir a URL completa
-    // Verificar se estamos em produção ou desenvolvimento
+    // Construir URL completa baseada no ambiente
     const isProduction = window.location.hostname !== 'localhost';
-    const baseUrl = isProduction ? 'http://samhost.wcore.com.br' : window.location.origin;
+    const baseUrl = isProduction ? 
+      `${window.location.protocol}//${window.location.hostname}` : 
+      window.location.origin;
     
     // Garantir que a URL comece com /content
     const videoPath = video.url.startsWith('/content') ? video.url : `/content${video.url}`;
-    return `${baseUrl}${videoPath}`;
+    const fullUrl = `${baseUrl}${videoPath}`;
+    
+    console.log(`URL construída para vídeo ${video.nome}: ${fullUrl}`);
+    return fullUrl;
   };
 
   return (

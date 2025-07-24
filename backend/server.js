@@ -40,24 +40,101 @@
   app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
   // Servir arquivos estáticos do Wowza
-  app.use('/content', express.static('/usr/local/WowzaStreamingEngine/content', {
-    maxAge: '1h', // Cache por 1 hora
-    etag: true,
-    lastModified: true,
-    setHeaders: (res, path) => {
-      // Configurar headers CORS para vídeos
+  // Middleware dinâmico para servir arquivos do servidor Wowza correto
+  app.use('/content', async (req, res, next) => {
+    try {
+      // Extrair informações do usuário da URL ou token
+      const authHeader = req.headers.authorization;
+      let userId = null;
+      
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        try {
+          const jwt = require('jsonwebtoken');
+          const token = authHeader.substring(7);
+          const decoded = jwt.verify(token, process.env.JWT_SECRET || 'sua_chave_secreta_super_segura_aqui');
+          userId = decoded.userId;
+        } catch (error) {
+          console.warn('Token inválido para acesso ao conteúdo:', error.message);
+        }
+      }
+      
+      // Se não conseguiu obter userId do token, tentar extrair da URL
+      if (!userId) {
+        const urlParts = req.path.split('/');
+        if (urlParts.length > 1) {
+          // Tentar encontrar usuário baseado no caminho
+          const possibleUser = urlParts[1];
+          if (possibleUser) {
+            try {
+              const [userRows] = await db.execute(
+                'SELECT codigo FROM streamings WHERE login = ? OR identificacao = ? LIMIT 1',
+                [possibleUser, possibleUser]
+              );
+              if (userRows.length > 0) {
+                userId = userRows[0].codigo;
+              }
+            } catch (error) {
+              console.warn('Erro ao buscar usuário pela URL:', error.message);
+            }
+          }
+        }
+      }
+      
+      // Configurar headers CORS
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Range');
+      res.setHeader('Access-Control-Allow-Headers', 'Range, Authorization');
       res.setHeader('Accept-Ranges', 'bytes');
       
       // Headers para cache de vídeos
-      if (path.match(/\.(mp4|avi|mov|wmv|flv|webm|mkv)$/i)) {
+      if (req.path.match(/\.(mp4|avi|mov|wmv|flv|webm|mkv|png|jpg|jpeg|gif)$/i)) {
         res.setHeader('Cache-Control', 'public, max-age=3600');
-        res.setHeader('Content-Type', 'video/mp4');
+        
+        if (req.path.match(/\.(mp4|avi|mov|wmv|flv|webm|mkv)$/i)) {
+          res.setHeader('Content-Type', 'video/mp4');
+        }
       }
+      
+      // Se temos userId, usar o servidor Wowza específico do usuário
+      if (userId) {
+        try {
+          const WowzaStreamingService = require('./config/WowzaStreamingService');
+          const wowzaService = new WowzaStreamingService();
+          const initialized = await wowzaService.initializeFromDatabase(userId);
+          
+          if (initialized) {
+            const userContentPath = wowzaService.getUserContentPath(wowzaService.userLogin || 'default');
+            const filePath = path.join(userContentPath, req.path);
+            
+            console.log(`Servindo arquivo do servidor específico: ${filePath}`);
+            
+            // Verificar se arquivo existe
+            try {
+              await fs.access(filePath);
+              return res.sendFile(filePath);
+            } catch (error) {
+              console.warn(`Arquivo não encontrado no servidor específico: ${filePath}`);
+            }
+          }
+        } catch (error) {
+          console.warn('Erro ao acessar servidor específico:', error.message);
+        }
+      }
+      
+      // Fallback para o caminho padrão
+      const defaultPath = `/usr/local/WowzaStreamingEngine/content${req.path}`;
+      try {
+        await fs.access(defaultPath);
+        return res.sendFile(defaultPath);
+      } catch (error) {
+        console.error(`Arquivo não encontrado: ${defaultPath}`);
+        return res.status(404).json({ error: 'Arquivo não encontrado' });
+      }
+      
+    } catch (error) {
+      console.error('Erro no middleware de conteúdo:', error);
+      return res.status(500).json({ error: 'Erro interno do servidor' });
     }
-  }));
   
   // Servir arquivos estáticos do frontend em produção
   if (isProduction) {

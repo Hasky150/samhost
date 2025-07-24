@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs').promises;
 const db = require('../config/database');
 const authMiddleware = require('../middlewares/authMiddleware');
+const WowzaStreamingService = require('../config/WowzaStreamingService');
 
 const router = express.Router();
 
@@ -12,17 +13,32 @@ const storage = multer.diskStorage({
   destination: async (req, file, cb) => {
     try {
       const userId = req.user.id;
-      const userEmail = req.user.email.split('@')[0];
+      const userLogin = req.user.email.split('@')[0];
       const folderId = req.query.folder_id || 'default';
       
-      // Caminho no Wowza: /usr/local/WowzaStreamingEngine/content/{userEmail}/{folderId}/
-      const wowzaPath = `/usr/local/WowzaStreamingEngine/content/${userEmail}/${folderId}`;
+      // Inicializar serviço Wowza para obter o servidor correto do usuário
+      const wowzaService = new WowzaStreamingService();
+      const initialized = await wowzaService.initializeFromDatabase(userId);
+      
+      if (!initialized) {
+        throw new Error('Erro ao conectar com servidor de streaming do usuário');
+      }
+      
+      // Obter caminho do conteúdo baseado no servidor do usuário
+      const userContentPath = wowzaService.getUserContentPath(userLogin);
+      const wowzaPath = `${userContentPath}/${folderId}`;
+      
+      console.log(`Caminho de upload para usuário ${userLogin}: ${wowzaPath}`);
       
       // Criar diretório se não existir
       await fs.mkdir(wowzaPath, { recursive: true });
       
+      // Garantir que o diretório do usuário existe no servidor Wowza
+      await wowzaService.ensureUserDirectory(userLogin);
+      
       cb(null, wowzaPath);
     } catch (error) {
+      console.error('Erro ao configurar destino do upload:', error);
       cb(error);
     }
   },
@@ -59,14 +75,23 @@ const upload = multer({
 router.get('/', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
+    const userLogin = req.user.email.split('@')[0];
     const folderId = req.query.folder_id;
     
     if (!folderId) {
       return res.status(400).json({ error: 'folder_id é obrigatório' });
     }
 
-    const userEmail = req.user.email.split('@')[0];
-    const folderPath = `/${userEmail}/${folderId}/`;
+    // Inicializar serviço Wowza para obter o servidor correto do usuário
+    const wowzaService = new WowzaStreamingService();
+    const initialized = await wowzaService.initializeFromDatabase(userId);
+    
+    if (!initialized) {
+      return res.status(500).json({ error: 'Erro ao conectar com servidor de streaming' });
+    }
+
+    // Buscar vídeos baseado no caminho do servidor do usuário
+    const folderPath = `/${userLogin}/${folderId}/`;
 
     const [rows] = await db.execute(
       `SELECT 
@@ -74,18 +99,23 @@ router.get('/', authMiddleware, async (req, res) => {
         video as nome,
         path_video as url,
         duracao_segundos as duracao,
-        CHAR_LENGTH(video) * 1024 as tamanho
+        CHAR_LENGTH(video) * 1024 as tamanho,
+        codigo_servidor
        FROM playlists_videos 
-       WHERE path_video LIKE ?
+       WHERE path_video LIKE ? OR (path_video LIKE ? AND codigo_servidor = ?)
        ORDER BY codigo`,
-      [`%${folderPath}%`]
+      [`%${folderPath}%`, `%/${userLogin}/%`, wowzaService.serverId]
     );
 
-    // Ajustar URLs para serem acessíveis via HTTP
+    // Ajustar URLs para serem acessíveis via HTTP do servidor correto
     const videos = rows.map(video => ({
       ...video,
-      url: video.url ? (video.url.startsWith('/content') ? video.url : `/content${video.url}`) : null
+      url: video.url ? (video.url.startsWith('/content') ? video.url : `/content${video.url}`) : null,
+      servidor_ip: wowzaService.wowzaHost,
+      servidor_id: wowzaService.serverId
     }));
+
+    console.log(`Encontrados ${videos.length} vídeos para usuário ${userLogin} na pasta ${folderId}`);
 
     res.json(videos);
   } catch (err) {
@@ -102,10 +132,18 @@ router.post('/upload', authMiddleware, upload.single('video'), async (req, res) 
     }
 
     const userId = req.user.id;
-    const userEmail = req.user.email.split('@')[0];
+    const userLogin = req.user.email.split('@')[0];
     const folderId = req.query.folder_id || 'default';
     const duracao = parseInt(req.body.duracao) || 0;
     const tamanho = parseInt(req.body.tamanho) || req.file.size;
+
+    // Inicializar serviço Wowza para obter o servidor correto do usuário
+    const wowzaService = new WowzaStreamingService();
+    const initialized = await wowzaService.initializeFromDatabase(userId);
+    
+    if (!initialized) {
+      return res.status(500).json({ error: 'Erro ao conectar com servidor de streaming' });
+    }
 
     // Verificar espaço disponível do usuário
     const [userSpaceRows] = await db.execute(
@@ -126,15 +164,19 @@ router.post('/upload', authMiddleware, upload.single('video'), async (req, res) 
     }
 
     // Caminho relativo para salvar no banco
-    const relativePath = `/${userEmail}/${folderId}/${req.file.filename}`;
+    const relativePath = `/${userLogin}/${folderId}/${req.file.filename}`;
+    
+    console.log(`Salvando vídeo: ${req.file.originalname}`);
+    console.log(`Caminho relativo: ${relativePath}`);
+    console.log(`Servidor Wowza: ${wowzaService.wowzaHost} (ID: ${wowzaService.serverId})`);
 
     // Inserir vídeo na tabela playlists_videos
     const [result] = await db.execute(
       `INSERT INTO playlists_videos (
         codigo_playlist, path_video, video, width, height, 
-        bitrate, duracao, duracao_segundos, tipo, ordem
-      ) VALUES (0, ?, ?, 1920, 1080, 2500, ?, ?, 'video', 0)`,
-      [relativePath, req.file.originalname, '00:00:00', duracao]
+        bitrate, duracao, duracao_segundos, tipo, ordem, codigo_servidor
+      ) VALUES (0, ?, ?, 1920, 1080, 2500, ?, ?, 'video', 0, ?)`,
+      [relativePath, req.file.originalname, '00:00:00', duracao, wowzaService.serverId]
     );
 
     // Atualizar espaço usado do usuário
@@ -151,7 +193,10 @@ router.post('/upload', authMiddleware, upload.single('video'), async (req, res) 
       nome: req.file.originalname,
       url: `/content${relativePath}`,
       duracao: duracao,
-      tamanho: tamanho
+      tamanho: tamanho,
+      servidor_ip: wowzaService.wowzaHost,
+      servidor_id: wowzaService.serverId,
+      path_completo: `${wowzaService.getUserContentPath(userLogin)}/${folderId}/${req.file.filename}`
     });
   } catch (err) {
     console.error('Erro no upload:', err);
@@ -164,10 +209,15 @@ router.delete('/:id', authMiddleware, async (req, res) => {
   try {
     const videoId = req.params.id;
     const userId = req.user.id;
+    const userLogin = req.user.email.split('@')[0];
+
+    // Inicializar serviço Wowza
+    const wowzaService = new WowzaStreamingService();
+    const initialized = await wowzaService.initializeFromDatabase(userId);
 
     // Buscar vídeo
     const [videoRows] = await db.execute(
-      'SELECT path_video, video FROM playlists_videos WHERE codigo = ?',
+      'SELECT path_video, video, codigo_servidor FROM playlists_videos WHERE codigo = ?',
       [videoId]
     );
 
@@ -176,17 +226,27 @@ router.delete('/:id', authMiddleware, async (req, res) => {
     }
 
     const video = videoRows[0];
-    const userEmail = req.user.email.split('@')[0];
 
     // Verificar se o vídeo pertence ao usuário
-    if (!video.path_video.includes(`/${userEmail}/`)) {
+    if (!video.path_video.includes(`/${userLogin}/`)) {
       return res.status(403).json({ error: 'Acesso negado' });
+    }
+
+    // Verificar se o vídeo está no servidor correto
+    if (initialized && video.codigo_servidor && video.codigo_servidor !== wowzaService.serverId) {
+      console.warn(`Vídeo está em servidor diferente: ${video.codigo_servidor} vs ${wowzaService.serverId}`);
+      // Continuar com a remoção mesmo assim
     }
 
     // Remover arquivo físico
     try {
-      const fullPath = `/usr/local/WowzaStreamingEngine/content${video.path_video}`;
+      const fullPath = initialized ? 
+        `${wowzaService.getUserContentPath(userLogin)}${video.path_video.replace(`/${userLogin}`, '')}` :
+        `/usr/local/WowzaStreamingEngine/content${video.path_video}`;
+      
+      console.log(`Tentando remover arquivo: ${fullPath}`);
       await fs.unlink(fullPath);
+      console.log(`Arquivo removido com sucesso: ${fullPath}`);
     } catch (fileError) {
       console.warn('Erro ao remover arquivo físico:', fileError.message);
     }
