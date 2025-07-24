@@ -135,6 +135,8 @@
       console.error('Erro no middleware de conteúdo:', error);
       return res.status(500).json({ error: 'Erro interno do servidor' });
     }
+  }
+  )
   
   // Servir arquivos estáticos do frontend em produção
   if (isProduction) {
